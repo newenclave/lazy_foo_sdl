@@ -1,10 +1,15 @@
 #include <iostream>
 #include <memory>
+#include <queue>
 
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_image.h>
 
 #include "lsdl/object_ptr.hpp"
+
+#include <condition_variable>
+#include <mutex>
+#include <functional>
 
 using namespace lsdl;
 
@@ -22,8 +27,201 @@ object_ptr<SDL_Texture> load_text( SDL_Renderer *rndr, const char *path )
 #define SCREEN_WIDTH  640
 #define SCREEN_HEIGHT 480
 
+template <typename ValueType>
+struct queue_trait {
+    typedef ValueType value_type;
+    typedef std::queue<value_type> queue_type;
+
+    static
+    void push( queue_type &q, const value_type &value )
+    {
+        q.emplace( value );
+    }
+
+    static
+    value_type &front( queue_type &q )
+    {
+        return q.front( );
+    }
+
+    static
+    const value_type &front( const queue_type &q )
+    {
+        return q.front( );
+    }
+
+    static
+    void pop( queue_type &q )
+    {
+        return q.pop( );
+    }
+
+    static
+    size_t size( const queue_type &q )
+    {
+        return q.size( );
+    }
+
+    static
+    bool empty( const queue_type &q )
+    {
+        return q.empty( );
+    }
+
+    static
+    void clear( queue_type &q )
+    {
+        q.clear( );
+    }
+};
+
+enum result_enum {
+    WAIT_OK       = 0,
+    WAIT_CANCELED = 1,
+    WAIT_TIMEOUT  = 2,
+};
+
+template <typename ValueType, typename MutexType = std::mutex,
+          typename ConditionalType = std::condition_variable,
+          typename QueueTrait = queue_trait<ValueType> >
+class condition_queue {
+
+public:
+
+    typedef QueueTrait                      q_traits;
+    typedef ValueType                       value_type;
+    typedef MutexType                       mutex_type;
+    typedef std::unique_lock<mutex_type>    locker_type;
+    typedef std::condition_variable         conditional_type;
+    typedef typename q_traits::queue_type   queue_type;
+
+    condition_queue( )
+        :cancel_(false)
+    { }
+
+    void reset( )
+    {
+        locker_type l(queue_lock_);
+        cancel_ = false;
+    }
+
+    void clear( )
+    {
+        locker_type l(queue_lock_);
+        q_traits::clear( queue_ );
+    }
+
+    void cancel( )
+    {
+        locker_type l(queue_lock_);
+        cancel_ = true;
+        queue_cond_.notify_all( );
+    }
+
+    void push( const value_type &new_value )
+    {
+        locker_type l(queue_lock_);
+        q_traits::push( queue_, new_value );
+        queue_cond_.notify_one( );
+    }
+
+    template <typename Duration>
+    result_enum wait_for( value_type &out, const Duration &dur )
+    {
+        locker_type l(queue_lock_);
+        bool wr = queue_cond_.wait_for( l, dur, not_empty(this) );
+        if( wr ) {
+            if( cancel_ ) {
+                return WAIT_CANCELED;
+            } else {
+                std::swap(out, q_traits::front( queue_ ));
+                q_traits::pop( queue_ );
+                return WAIT_OK;
+            }
+        }
+        return WAIT_TIMEOUT;
+    }
+
+    result_enum wait( value_type &out )
+    {
+        locker_type l(queue_lock_);
+        queue_cond_.wait( l, not_empty(this) );
+        if( cancel_ ) {
+            return WAIT_CANCELED;
+        } else {
+            std::swap(out, q_traits::front( queue_ ));
+            q_traits::pop( queue_ );
+            return WAIT_OK;
+        }
+    }
+
+    result_enum wait0( value_type &out )
+    {
+        locker_type l(queue_lock_);
+        if( !q_traits::front( queue_ ) ) {
+            std::swap(out, q_traits::front( queue_ ));
+            q_traits::pop( queue_ );
+            return WAIT_OK;
+        } else {
+            return WAIT_TIMEOUT;
+        }
+    }
+
+    bool canceled( ) const
+    {
+        locker_type l(queue_lock_);
+        return cancel_;
+    }
+
+private:
+
+    struct not_empty {
+
+        not_empty( const condition_queue *parent )
+            :parent_(parent)
+        { }
+
+        not_empty &operator = (const not_empty& other)
+        {
+            parent_ = other.parent_;
+            return *this;
+        }
+
+        bool operator ( )( ) const
+        {
+            return !q_traits::empty(parent_->queue_) || parent_->cancel_;
+        }
+
+        const condition_queue *parent_;
+    };
+
+    friend struct not_empty;
+
+    bool                cancel_;
+    queue_type          queue_;
+    conditional_type    queue_cond_;
+    mutex_type          queue_lock_;
+};
+
 int main( )
 {
+
+    using func_queue = condition_queue<std::function<void( )> >;
+
+    func_queue calls;
+
+    calls.push( [ ]( ) { std::cout << "Hello"; } );
+    calls.push( [ ]( ) { std::cout << ", "; } );
+    calls.push( [ ]( ) { std::cout << "world!\n"; } );
+
+    std::function<void( )> c;
+
+    while( WAIT_OK == calls.wait_for( c, std::chrono::nanoseconds(0) ) ) {
+        c( );
+    }
+
+    return 0;
+
     int res = SDL_Init( SDL_INIT_VIDEO );
 
     object_ptr<SDL_Window> main_window =
